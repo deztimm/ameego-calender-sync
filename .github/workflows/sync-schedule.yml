@@ -1,0 +1,43 @@
+name: Sync Ameego Schedule
+
+on:
+  # PHASE 1: leave this as manual-only until we've confirmed login works.
+  # Once debug/03-after-login.png shows we're actually logged in, and the
+  # real shift-scraping code is added, uncomment the schedule below so it
+  # runs on its own.
+  #
+  # schedule:
+  #   - cron: "0 */3 * * *"   # every 3 hours
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          AMEEGO_USERNAME: ${{ secrets.AMEEGO_USERNAME }}
+          AMEEGO_PASSWORD: ${{ secrets.AMEEGO_PASSWORD }}
+          AMEEGO_CLIENT_ID: ${{ secrets.AMEEGO_CLIENT_ID }}
+        run: python scrape_schedule.py
+
+      # Runs whether the step above succeeded or failed, so we always get
+      # to see what the script saw.
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: debug/
+          retention-days: 7
