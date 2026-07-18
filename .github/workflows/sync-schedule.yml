@@ -9,7 +9,12 @@ on:
   # remind you / update it.
   schedule:
     - cron: "0 4 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (log what would change on the Family calendar, but don't actually change it)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -26,7 +31,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright
+          pip install playwright caldav
           playwright install --with-deps chromium
 
       - name: Run scraper
@@ -34,6 +39,9 @@ jobs:
           AMEEGO_USERNAME: ${{ secrets.AMEEGO_USERNAME }}
           AMEEGO_PASSWORD: ${{ secrets.AMEEGO_PASSWORD }}
           AMEEGO_CLIENT_ID: ${{ secrets.AMEEGO_CLIENT_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
         run: python scrape_schedule.py
 
       # Runs whether the step above succeeded or failed, so we always get
