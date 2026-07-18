@@ -1,14 +1,18 @@
 name: Sync Ameego Schedule
 
 on:
-  # PHASE 1: leave this as manual-only until we've confirmed login works.
-  # Once debug/03-after-login.png shows we're actually logged in, and the
-  # real shift-scraping code is added, uncomment the schedule below so it
-  # runs on its own.
-  #
-  # schedule:
-  #   - cron: "0 */3 * * *"   # every 3 hours
+  # Every day at 11:00 PM Central Time (Winnipeg) = 04:00 UTC the next day,
+  # while Manitoba is on Daylight Time (CDT, UTC-5). Central switches to
+  # Standard Time (CST, UTC-6) in November -- when that happens this will
+  # quietly start firing at 10:00 PM local instead of 11:00 PM, until the
+  # line below is changed to "0 5 * * *". Ping me in November and I'll
+  # remind you / update it.
+  schedule:
+    - cron: "0 4 * * *"
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   sync:
@@ -41,3 +45,23 @@ jobs:
           name: debug-output
           path: debug/
           retention-days: 7
+
+      - name: Upload calendar file
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calendar-file
+          path: my-shifts.ics
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Commit updated calendar file to the repo
+        if: success()
+        run: |
+          if [ -f my-shifts.ics ]; then
+            git config user.name "ameego-sync-bot"
+            git config user.email "actions@github.com"
+            git add my-shifts.ics
+            git commit -m "Update schedule" || echo "No changes to commit"
+            git push
+          fi
