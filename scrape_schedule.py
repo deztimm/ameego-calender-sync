@@ -1,34 +1,31 @@
 """
-Ameego -> Apple Calendar sync script (PHASE 1: login recon).
+Ameego -> Apple Calendar sync script.
 
-What this does right now:
-  1. Opens the Ameego login page in a real (headless) browser, since the
-     site is a JavaScript app and won't respond to plain HTTP requests.
-  2. Tries a handful of common patterns to find and fill the
-     username / password / client ID fields, since the real markup
-     hasn't been inspected yet.
-  3. Saves a screenshot + full HTML of what it sees at each step into
-     debug/ , win or lose.
-  4. If login looks like it worked, it stops there and reports it, so
-     we can see the schedule page's real structure before writing the
-     part that reads shifts off of it.
+Confirmed working:
+  - Login (username / password / client ID + submit) succeeds.
+  - The post-login dashboard has an "Upcoming Shifts" box with date,
+    start time, and a department/role label for each shift.
 
-What this does NOT do yet:
-  Extract real shift data or generate a calendar file. That's phase 2,
-  once we can see debug/03-after-login.png (and, ideally, the schedule
-  page after that) and know what we're actually parsing. The
-  generate_ics() helper below is already written and ready for that --
-  it just isn't called with real data yet.
+What this does:
+  1. Logs in using the real field IDs from the Ameego login page.
+  2. Reads the "Upcoming Shifts" list off the dashboard and builds a
+     calendar (.ics) file from it -- one event per shift, titled
+     "Dez work", starting at the real shift start time.
+  3. The dashboard doesn't show when a shift ends, and we're not
+     chasing that down -- every event gets a fixed 5-hour block
+     instead.
 
-Required GitHub Actions secrets (Settings -> Secrets and variables -> Actions):
+Required GitHub Actions secrets:
   AMEEGO_USERNAME
   AMEEGO_PASSWORD
-  AMEEGO_CLIENT_ID   (optional -- only if your login screen asks for one)
+  AMEEGO_CLIENT_ID
 """
 
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import date as date_cls
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import sync_playwright
 
@@ -39,6 +36,12 @@ PASSWORD = os.environ.get("AMEEGO_PASSWORD")
 CLIENT_ID = os.environ.get("AMEEGO_CLIENT_ID")
 
 DEBUG_DIR = "debug"
+ICS_PATH = "my-shifts.ics"
+
+MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
 
 def log(msg):
@@ -61,102 +64,87 @@ def save_debug(page, name):
     log(f"Saved {png_path} and {html_path}")
 
 
-def find_and_fill(page, selectors, value, label):
-    """Try selectors in order; fill + report the first visible match."""
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible(timeout=1500):
-                loc.fill(value)
-                log(f"Filled {label} using selector: {sel}")
-                return True
-        except Exception:
-            continue
-    log(f"Could not find a field for {label} using any known selector.")
-    return False
-
-
-def attempt_login(page):
+def login(page):
     log(f"Opening {AMEEGO_LOGIN_URL}")
     page.goto(AMEEGO_LOGIN_URL, wait_until="networkidle", timeout=30000)
-    page.wait_for_timeout(2000)  # let the JS app finish rendering
+    page.wait_for_timeout(1500)
     save_debug(page, "01-login-page")
 
+    page.fill("#username", USERNAME)
+    page.fill("#password", PASSWORD)
     if CLIENT_ID:
-        find_and_fill(
-            page,
-            [
-                'input[name*="client" i]',
-                'input[id*="client" i]',
-                'input[placeholder*="client" i]',
-            ],
-            CLIENT_ID,
-            "Client ID",
-        )
+        page.fill("#client-id", CLIENT_ID)
 
-    filled_user = find_and_fill(
-        page,
-        [
-            'input[name*="user" i]',
-            'input[id*="user" i]',
-            'input[placeholder*="user" i]',
-            'input[type="email"]',
-            'input[type="text"]',
-        ],
-        USERNAME,
-        "Username",
-    )
-
-    filled_pass = find_and_fill(
-        page,
-        ['input[type="password"]'],
-        PASSWORD,
-        "Password",
-    )
-
-    if not (filled_user and filled_pass):
-        save_debug(page, "02-fields-not-found")
-        log(
-            "Stopping: couldn't find both username and password fields. "
-            "Check debug/02-fields-not-found.png and .html."
-        )
-        return False
-
-    try:
-        page.locator(
-            'button[type="submit"], '
-            'button:has-text("Sign in"), '
-            'button:has-text("Log in"), '
-            'button:has-text("Login")'
-        ).first.click(timeout=3000)
-        log("Clicked a likely submit button.")
-    except Exception:
-        log("No obvious submit button found, pressing Enter instead.")
-        page.keyboard.press("Enter")
-
+    page.click('button[type="submit"]')
     page.wait_for_timeout(4000)
-    save_debug(page, "03-after-login")
-    return True
+    save_debug(page, "02-dashboard")
 
 
-def generate_ics(shifts):
-    """
-    Turn a list of shift dicts into an .ics file (text/calendar).
-    Each shift: {"date": "2026-07-14", "start": "16:00", "end": "22:00",
-                 "label": "Work Shift"}
-    Not wired up to real data yet -- kept ready for phase 2.
-    """
+def parse_dashboard_date(text, today=None):
+    today = today or date_cls.today()
+    parts = text.replace("\n", " ").split()
+    month_abbr = parts[-2][:3]
+    day_num = int(re.sub(r"\D", "", parts[-1]))
+    month_num = MONTHS.get(month_abbr, 1)
+    candidate = date_cls(today.year, month_num, day_num)
+    # Handle year rollover (e.g. running in December about a January shift)
+    if (today - candidate).days > 60:
+        candidate = date_cls(today.year + 1, month_num, day_num)
+    return candidate.isoformat()
 
+
+def parse_time_12h(text):
+    text = text.strip().lower()
+    m = re.match(r"(\d{1,2}):(\d{2})\s*(am|pm)", text)
+    if not m:
+        return None
+    h, mnt, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+    if ap == "pm" and h != 12:
+        h += 12
+    if ap == "am" and h == 12:
+        h = 0
+    return f"{h:02d}:{mnt:02d}"
+
+
+def extract_dashboard_shifts(page):
+    shifts = []
+    rows = page.locator(
+        'div.col-sm-7:has(h3:has-text("Upcoming Shifts")) > div.col-sm-12'
+    )
+    count = rows.count()
+    log(f"Found {count} row(s) in the Upcoming Shifts box.")
+
+    for i in range(count):
+        row = rows.nth(i)
+        try:
+            date_text = row.locator("span").first.inner_text()
+            info = row.locator(".col-xs-9 > div")
+            time_text = info.locator("> div").nth(0).inner_text()
+            label_text = info.locator("> div").nth(1).inner_text()
+        except Exception as e:
+            log(f"Skipping row {i}, couldn't read it: {e}")
+            continue
+
+        iso_date = parse_dashboard_date(date_text)
+        start_24h = parse_time_12h(time_text)
+        label = " ".join(label_text.split())
+
+        if not (iso_date and start_24h):
+            log(f"Skipping row {i}, couldn't parse date/time from {date_text!r} / {time_text!r}")
+            continue
+
+        shifts.append({"date": iso_date, "start": start_24h, "label": label})
+        log(f"Parsed shift: {iso_date} {start_24h} - {label}")
+
+    return shifts
+
+
+def generate_ics(shifts, placeholder_hours=5):
     def pad(n):
         return str(n).zfill(2)
 
     def escape(text):
-        return (
-            str(text)
-            .replace("\\", "\\\\")
-            .replace(",", "\\,")
-            .replace(";", "\\;")
-        )
+        return str(text).replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;")
 
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
@@ -166,28 +154,24 @@ def generate_ics(shifts):
         "VERSION:2.0",
         "PRODID:-//Ameego Sync//EN",
         "CALSCALE:GREGORIAN",
+        "X-WR-CALNAME:Dez Work",
     ]
 
     for i, s in enumerate(shifts):
-        date_compact = s["date"].replace("-", "")
-        start_compact = s["start"].replace(":", "") + "00"
-        end_compact = s["end"].replace(":", "") + "00"
-        overnight = s["end"] <= s["start"]
-        end_date_compact = date_compact
-        if overnight:
-            y, m, d = (int(s["date"][0:4]), int(s["date"][5:7]), int(s["date"][8:10]))
-            from datetime import date, timedelta
+        start_dt = datetime.strptime(f"{s['date']} {s['start']}", "%Y-%m-%d %H:%M")
+        end_dt = start_dt + timedelta(hours=placeholder_hours)
 
-            nd = date(y, m, d) + timedelta(days=1)
-            end_date_compact = f"{nd.year}{pad(nd.month)}{pad(nd.day)}"
+        dtstart = start_dt.strftime("%Y%m%dT%H%M00")
+        dtend = end_dt.strftime("%Y%m%dT%H%M00")
+        summary = escape("Dez work")
 
         lines += [
             "BEGIN:VEVENT",
             f"UID:{now.timestamp()}-{i}@ameego-sync",
             f"DTSTAMP:{stamp}",
-            f"DTSTART:{date_compact}T{start_compact}",
-            f"DTEND:{end_date_compact}T{end_compact}",
-            f"SUMMARY:{escape(s.get('label') or 'Work Shift')}",
+            f"DTSTART:{dtstart}",
+            f"DTEND:{dtend}",
+            f"SUMMARY:{summary}",
             "END:VEVENT",
         ]
 
@@ -197,23 +181,25 @@ def generate_ics(shifts):
 
 def main():
     if not USERNAME or not PASSWORD:
-        log("Missing AMEEGO_USERNAME or AMEEGO_PASSWORD secrets. Set them in "
-            "Settings -> Secrets and variables -> Actions, then re-run.")
+        log("Missing AMEEGO_USERNAME or AMEEGO_PASSWORD secrets.")
         sys.exit(1)
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
-        ok = attempt_login(page)
+
+        login(page)
+        shifts = extract_dashboard_shifts(page)
+
         browser.close()
 
-    if ok:
-        log(
-            "Login attempted -- check debug/03-after-login.png to see where "
-            "we landed. Share that (and 01-login-page.png if login failed) "
-            "so the real shift-scraping step can be written next."
-        )
+    if shifts:
+        ics_content = generate_ics(shifts)
+        with open(ICS_PATH, "w", encoding="utf-8") as f:
+            f.write(ics_content)
+        log(f"Wrote {ICS_PATH} with {len(shifts)} shift(s).")
     else:
+        log("No shifts were extracted -- check debug/02-dashboard.png.")
         sys.exit(1)
 
 
