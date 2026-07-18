@@ -236,13 +236,29 @@ def sync_to_family_calendar(shifts):
     log(f"Calendars visible to this account: {names}")
 
     target = None
+    candidates = []
     for c in calendars:
         try:
-            if c.name and FAMILY_CALENDAR_HINT in c.name.lower():
-                target = c
-                break
+            nm = c.name or ""
         except Exception:
             continue
+        if FAMILY_CALENDAR_HINT in nm.lower():
+            candidates.append(c)
+
+    if len(candidates) > 1:
+        log(
+            f"Note: {len(candidates)} calendars matched '{FAMILY_CALENDAR_HINT}': "
+            f"{[c.name for c in candidates]} -- preferring an exact 'family' name match."
+        )
+
+    # Prefer an exact match (e.g. plain "Family") over a decorated one
+    # (e.g. "Family ⚠️", which usually signals something's off with it).
+    for c in candidates:
+        if c.name.strip().lower() == FAMILY_CALENDAR_HINT:
+            target = c
+            break
+    if not target and candidates:
+        target = candidates[0]
 
     if not target:
         log(
